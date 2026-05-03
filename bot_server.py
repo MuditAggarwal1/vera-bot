@@ -142,7 +142,8 @@ async def tick(request: Request):
         kind = trigger.get("kind", "")
         payload = trigger.get("payload", {})
 
-        sup_key = f"tick::{merchant_id}::{kind}"
+        # Only suppress if same trigger_id already fired (not just kind+merchant)
+        sup_key = f"tick::{trigger_id}"
         if is_suppressed(sup_key):
             continue
 
@@ -184,32 +185,44 @@ Trigger payload: {json.dumps(payload)}
 Category context: {json.dumps(category_ctx)}
 """
 
-        user_prompt = f"""Write a WhatsApp message from Vera to the merchant for trigger kind '{kind}'.
+        # Build kind-specific instruction with hard payload injection
+        kind_instructions = {
+            "perf_dip": f"Views {payload.get('drop_pct', '')}% girein hain {payload.get('period', 'recently')} mein. Yeh number ZAROOR mention karo.",
+            "new_competitor": f"'{payload.get('competitor_name', 'ek naya competitor')}' sirf {payload.get('distance_km', '')} km door khula hai. Yeh naam aur distance ZAROOR mention karo.",
+            "festival": f"{payload.get('festival', 'upcoming festival')} mein sirf {payload.get('days_until', '')} din bacha hai. Festival name aur days ZAROOR mention karo.",
+            "research_digest": f"'{payload.get('top_query', '')}' {payload.get('search_volume', '')} baar search hua is week. Query aur volume ZAROOR mention karo.",
+            "regulation_change": f"Naya regulation: '{payload.get('regulation', '')}'. Yeh regulation name ZAROOR mention karo.",
+            "low_inventory": f"'{payload.get('item', '')}' sirf {payload.get('units_left', '')} units bachi hain. Item name aur count ZAROOR mention karo.",
+        }
+        specificity_instruction = kind_instructions.get(kind, f"Payload data: {json.dumps(payload)} — koi bhi specific number ya naam zaroor mention karo.")
 
-Trigger details: {json.dumps(payload)}
+        user_prompt = f"""Write a WhatsApp message from Vera to {merchant_name} for trigger kind '{kind}'.
 
-Rules:
-- Address merchant by name if known
-- Mention specific numbers from the trigger payload or merchant context
-- End with a question or clear CTA
-- Max 60 words, Hinglish tone
-- Do NOT use emojis excessively (max 1-2)
+CRITICAL RULE: {specificity_instruction}
+
+Full trigger payload: {json.dumps(payload)}
+
+Additional rules:
+- Max 60 words, Hinglish (Hindi + English mix)
+- End with a specific question or CTA
+- Sound like a helpful business advisor, not a bot
+- Max 1 emoji
 
 Write ONLY the message text, nothing else."""
 
         message = await call_claude(system_prompt, user_prompt, max_tokens=150)
 
-        # Fallback if API failed
+        # Fallback if API failed — always include payload-specific numbers
         if message.startswith("[API_ERROR"):
             kind_msgs = {
-                "perf_dip": f"{merchant_name} — aapki visibility last week thodi kam hui. Ek naya offer add karein?",
-                "new_competitor": f"Koi naya competitor aaya hai aapke area mein, {merchant_name}. Apna profile refresh karein!",
-                "festival": f"Festival season aa raha hai — {merchant_name} ke liye ek special deal banayein aaj?",
-                "research_digest": f"{merchant_name}, aapki category mein customers ye cheezein dhundh rahe hain. Discuss karein?",
-                "regulation_change": f"{merchant_name}, kuch naye compliance updates hain aapki category mein. Help chahiye?",
-                "low_inventory": f"Stock update time, {merchant_name}! Magicpin pe apna inventory refresh karein.",
+                "perf_dip": f"{merchant_name}, aapke {payload.get('metric','views')} {payload.get('drop_pct','')}% gire hain {payload.get('period','recently')}. Ek naya offer try karein? 📊",
+                "new_competitor": f"{merchant_name}, '{payload.get('competitor_name','ek naya clinic')}' sirf {payload.get('distance_km','')} km door khula hai. Profile update karein aaj! 💡",
+                "festival": f"{merchant_name}, {payload.get('festival','festival')} mein sirf {payload.get('days_until','')} din bache hain! Special deal launch karein? 🎉",
+                "research_digest": f"{merchant_name}, '{payload.get('top_query','aapki service')}' {payload.get('search_volume','')} baar search hua this week. Offer add karein?",
+                "regulation_change": f"{merchant_name}, '{payload.get('regulation','naya regulation')}' implement karna hoga. Compliance mein help chahiye?",
+                "low_inventory": f"{merchant_name}, '{payload.get('item','aapka item')}' sirf {payload.get('units_left','')} units bacha hai. Restock kab hoga?",
             }
-            message = kind_msgs.get(kind, f"{merchant_name}, kuch important update hai aapke liye. Baat karein?")
+            message = kind_msgs.get(kind, f"{merchant_name}, important update: {json.dumps(payload)}. Baat karein?")
 
         suppress(sup_key, hours=23)
         actions.append({
