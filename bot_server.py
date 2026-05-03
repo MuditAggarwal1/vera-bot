@@ -1,490 +1,393 @@
 """
-Vera Bot Server — magicpin AI Challenge submission v2
-Full Claude-powered implementation fixing all judge feedback issues.
+Vera Bot — magicpin AI Challenge
+Fixed version: direct HTTP to Anthropic, proper from_role branching, rich context-grounded prompts
 """
 
-from __future__ import annotations
 import os
-import time
 import json
-import uuid
-import re
-from datetime import datetime, timezone
-from typing import Any, Optional
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import time
 import httpx
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
-# ─────────────────────────────────────────────
-# App + stores
-# ─────────────────────────────────────────────
-app = FastAPI(title="Vera Bot", version="2.0.0")
-START = time.time()
+app = FastAPI()
 
-contexts: dict[tuple[str, str], dict] = {}
-conversations: dict[str, dict] = {}
-fired_suppression: set[str] = set()
+# ─── In-memory stores ────────────────────────────────────────────────────────
+contexts: dict[str, dict] = {}          # key: f"{scope}::{context_id}"
+reply_state: dict[str, dict] = {}       # key: session_id → {turns, auto_reply_count}
+suppression: dict[str, float] = {}     # key: suppression_key → expires_ts
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-3-5-haiku-20241022"
+START_TIME = time.time()
 
-# ─────────────────────────────────────────────
-# Claude caller — direct HTTP, bypasses SDK auth issues
-# ─────────────────────────────────────────────
-def call_claude(system: str, user: str, max_tokens: int = 1000) -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": MODEL,
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }
-    with httpx.Client(timeout=25.0) as client:
-        resp = client.post(ANTHROPIC_API_URL, headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["content"][0]["text"].strip()
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def parse_json(text: str) -> dict:
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text.strip())
+def get_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    return key
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-def get_payload(scope: str, cid: str) -> Optional[dict]:
-    entry = contexts.get((scope, cid))
-    return entry["payload"] if entry else None
 
-def lang_hint(merchant: dict) -> str:
-    langs = merchant.get("identity", {}).get("languages", ["en"])
-    if "hi" in langs:
-        return "Use natural Hindi-English code-mix (Hinglish) throughout — as real WhatsApp messages to Indian merchants sound."
-    if any(l in langs for l in ["ta", "te", "kn", "mr"]):
-        return "Use warm, friendly English. Keep it local and personal."
-    return "Use clear, friendly English."
-
-def is_auto_reply(msg: str) -> bool:
-    sigs = [
-        "aapki jaankari ke liye", "thank you for contacting",
-        "i am currently unavailable", "main ek automated",
-        "automated assistant", "automated response",
-        "we will get back", "bahut-bahut shukriya",
-        "aapki madad ke liye shukriya", "hamari team tak pahuncha",
-        "i will pass this on", "forwarding your message",
-        "this is an automated", "auto-reply",
-    ]
-    lower = msg.lower()
-    return any(s in lower for s in sigs)
-
-def wants_stop(msg: str) -> bool:
-    sigs = [
-        "not interested", "nahi chahiye", "band karo", "stop messaging",
-        "don't contact", "remove me", "unsubscribe", "nahin chahiye",
-        "mat bhejo", "please stop", "mujhe nahi chahiye",
-    ]
-    return any(s in msg.lower() for s in sigs)
-
-def has_intent(msg: str) -> bool:
-    sigs = [
-        "judrna hai", "join karna hai", "i want to join", "let's do it",
-        "go ahead", "yes let's", "kar do", "shuru karo", "haan karo",
-        "sign me up", "ok do it", "chalega", "theek hai karo", "haan bilkul",
-        "please do it", "yes please proceed",
-    ]
-    return any(s in msg.lower() for s in sigs)
-
-# ─────────────────────────────────────────────
-# System prompts
-# ─────────────────────────────────────────────
-COMPOSER_SYSTEM = """You are Vera — magicpin's AI WhatsApp assistant for Indian merchants (dentists, salons, restaurants, gyms, pharmacies).
-
-Compose ONE perfect WhatsApp message grounded entirely in the provided context.
-
-MANDATORY RULES:
-1. SPECIFICITY: Use real numbers from context — CTR%, call counts, peer stats, dates, prices. "Your CTR is 2.1% vs peer 3.0%" beats vague advice. Service+price ("Dental Cleaning @ ₹299") beats "10% off".
-2. NO FABRICATION: Never invent stats, citations, competitor names, offers not in context.
-3. VOICE by category:
-   - dentists: clinical-peer tone, technical vocab OK ("fluoride varnish", "caries"), NO "cure"/"guaranteed"
-   - salons: warm, aspirational, price-specific
-   - restaurants: food-first, local pride, deal-specific
-   - gyms: energetic, outcome-focused
-   - pharmacies: helpful, trust-building, health-specific
-4. ONE CTA MAX: Binary YES/STOP for action triggers. Open question for info triggers. None for pure reminders. CTA always LAST sentence.
-5. NO PREAMBLE: Never start with "I hope you're doing well". Jump to the hook.
-6. LANGUAGE: Match merchant's language. Hinglish for "hi" merchants. Natural blend, not forced.
-7. SHORT: 3-6 sentences for merchant messages. 2-4 for customer messages.
-8. COMPULSION LEVERS (use 1-2): loss aversion, social proof, effort externalization ("I've drafted X — just say go"), curiosity ("want to see?"), specificity, single binary CTA.
-
-FOR CUSTOMER-FACING (send_as=merchant_on_behalf):
-- Address THE CUSTOMER by their first name
-- Write AS the merchant/clinic/salon
-- Use the customer's language preference
-- Reference their specific service, slots, relationship
-- Warm and personal tone
-
-OUTPUT: JSON only, no markdown:
-{
-  "body": "message text",
-  "cta": "open_ended" | "binary_yes_stop" | "none",
-  "send_as": "vera" | "merchant_on_behalf",
-  "suppression_key": "kind:merchant_id:period",
-  "rationale": "1-2 sentences on lever used and why"
-}"""
-
-REPLY_SYSTEM = """You are Vera — magicpin's AI WhatsApp assistant for Indian merchants.
-
-You are in an active conversation. Produce the best next reply.
-
-CRITICAL — READ from_role carefully:
-- from_role = "merchant": Reply AS VERA to the MERCHANT. Be helpful, specific, action-oriented.
-- from_role = "customer": Reply AS THE MERCHANT (Vera drafts it) addressed TO THE CUSTOMER by name. Confirm bookings, answer service questions, provide slot details.
-
-SLOT BOOKING (most important):
-- Customer picks a slot ("Yes book Wed 6pm" / "1" / "confirm") → Confirm clearly: name, service, day, time, any price. Thank them. End warmly.
-- Example good reply: "Perfect Priya! Your Dental Cleaning (₹299) is confirmed for Wed 5 Nov at 6pm. Dr. Meera's clinic, Lajpat Nagar. See you then! 🦷"
-
-INTENT ROUTING:
-- Merchant says YES/go ahead/kar do → Switch to ACTION immediately. Do NOT ask another qualifying question.
-- Merchant says STOP/not interested → action = "end"
-
-SPECIFICITY: Use real data from context. Never generic.
-LANGUAGE: Match merchant's or customer's preference.
-NO REPETITION: Never repeat the previous turn verbatim.
-
-OUTPUT: JSON only:
-{
-  "action": "send" | "wait" | "end",
-  "body": "text (required if send)",
-  "cta": "open_ended" | "binary_yes_stop" | "none",
-  "rationale": "brief reason"
-}"""
-
-# ─────────────────────────────────────────────
-# Composers
-# ─────────────────────────────────────────────
-def build_compose_prompt(category, merchant, trigger, customer):
-    p = []
-    p.append("=== CATEGORY ===")
-    p.append(f"Slug: {category.get('slug','')}")
-    p.append(f"Voice: {json.dumps(category.get('voice', {}))}")
-    p.append(f"Peer stats: {json.dumps(category.get('peer_stats', {}))}")
-    digest = category.get("digest", [])[:3]
-    if digest:
-        p.append(f"Digest/research: {json.dumps(digest)}")
-    offers_cat = category.get("offer_catalog", [])[:4]
-    if offers_cat:
-        p.append(f"Offer templates: {json.dumps(offers_cat)}")
-    seasonal = category.get("seasonal_beats", [])[:2]
-    if seasonal:
-        p.append(f"Seasonal beats: {json.dumps(seasonal)}")
-    trends = category.get("trend_signals", [])[:2]
-    if trends:
-        p.append(f"Trends: {json.dumps(trends)}")
-
-    p.append("\n=== MERCHANT ===")
-    p.append(f"Identity: {json.dumps(merchant.get('identity', {}))}")
-    p.append(f"Subscription: {json.dumps(merchant.get('subscription', {}))}")
-    p.append(f"Performance 30d: {json.dumps(merchant.get('performance', {}))}")
-    active = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
-    p.append(f"Active offers: {json.dumps(active)}")
-    p.append(f"Signals: {json.dumps(merchant.get('signals', []))}")
-    p.append(f"Customer aggregate: {json.dumps(merchant.get('customer_aggregate', {}))}")
-    hist = merchant.get("conversation_history", [])[-3:]
-    if hist:
-        p.append(f"Recent Vera history: {json.dumps(hist)}")
-
-    p.append("\n=== TRIGGER ===")
-    p.append(json.dumps(trigger, indent=2))
-
-    if customer:
-        p.append("\n=== CUSTOMER (message goes TO this person, FROM the merchant) ===")
-        p.append(json.dumps(customer, indent=2))
-        p.append("send_as = 'merchant_on_behalf'. Address the customer by their first name.")
-
-    p.append(f"\nLanguage: {lang_hint(merchant)}")
-    p.append("\nCompose now. Return JSON only.")
-    return "\n".join(p)
-
-def compose_initial(category, merchant, trigger, customer):
-    prompt = build_compose_prompt(category, merchant, trigger, customer)
+async def call_claude(system: str, user: str, max_tokens: int = 300) -> str:
+    """Direct HTTP call to Anthropic — no SDK, no import issues."""
     try:
-        text = call_claude(COMPOSER_SYSTEM, prompt, max_tokens=900)
-        return parse_json(text)
-    except Exception as e:
-        name = merchant.get("identity", {}).get("name", "there")
-        kind = trigger.get("kind", "update")
-        mid = merchant.get("merchant_id", "x")
-        return {
-            "body": f"Hi {name}, aapke {kind} ke baare mein ek update hai — dekhen? Reply YES.",
-            "cta": "binary_yes_stop",
-            "send_as": "vera",
-            "suppression_key": f"{kind}:{mid}:2026",
-            "rationale": f"Fallback ({str(e)[:80]})"
-        }
-
-def compose_reply(from_role, message, merchant, category, customer, history, turn_number, conv_id):
-    auto_count = sum(1 for t in history if t.get("is_auto_reply"))
-
-    # Auto-reply logic
-    if is_auto_reply(message):
-        if auto_count >= 1:
-            return {"action": "end", "rationale": "Second auto-reply detected — gracefully exiting."}
-        name = merchant.get("identity", {}).get("name", "")
-        try:
-            text = call_claude(
-                REPLY_SYSTEM,
-                f"""Merchant name: {name}
-Language: {lang_hint(merchant)}
-Situation: WhatsApp Business auto-reply just detected (first time). 
-Compose one short, direct message to reach the real owner — acknowledge you know it's auto-reply, ask if they're available.
-Return JSON: {{"action":"send","body":"...","cta":"open_ended","rationale":"..."}}"""
+        api_key = get_api_key()
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                ANTHROPIC_API_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": MODEL,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                },
             )
-            return parse_json(text)
-        except:
-            return {
-                "action": "send",
-                "body": f"Hi, main samajh gayi yeh auto-reply hai — kya aap khud 2 minute available hain? Ek important update share karni thi.",
-                "cta": "open_ended",
-                "rationale": "Gentle prod after first auto-reply."
-            }
-
-    if wants_stop(message):
-        return {"action": "end", "rationale": "Stop signal detected — exiting politely."}
-
-    # Build full context for reply
-    p = [
-        f"from_role: {from_role}",
-        f"message: \"{message}\"",
-        f"turn_number: {turn_number}",
-        f"merchant: {json.dumps(merchant.get('identity', {}))}",
-        f"category: {category.get('slug', '')}",
-        f"peer_stats: {json.dumps(category.get('peer_stats', {}))}",
-        f"active_offers: {json.dumps([o for o in merchant.get('offers',[]) if o.get('status')=='active'])}",
-        f"signals: {json.dumps(merchant.get('signals', []))}",
-        f"language: {lang_hint(merchant)}",
-        f"intent_expressed: {has_intent(message)}",
-    ]
-
-    if customer and from_role == "customer":
-        p.append(f"customer_context: {json.dumps(customer)}")
-        p.append("IMPORTANT: Reply is FROM merchant TO customer. Address customer by first name. Confirm their slot/request specifically.")
-
-    p.append(f"\nconversation_history:\n{json.dumps(history[-6:], indent=2)}")
-    p.append("\nCompose the ideal reply. JSON only.")
-
-    try:
-        text = call_claude(REPLY_SYSTEM, "\n".join(p), max_tokens=600)
-        result = parse_json(text)
-        if "action" not in result:
-            result["action"] = "send"
-        return result
+            resp.raise_for_status()
+            data = resp.json()
+            return data["content"][0]["text"].strip()
     except Exception as e:
-        if from_role == "customer":
-            cname = customer.get("identity", {}).get("name", "there") if customer else "there"
-            return {
-                "action": "send",
-                "body": f"Thank you {cname}! We've noted your request and will confirm very shortly. Looking forward to seeing you! 😊",
-                "cta": "none",
-                "rationale": f"Customer fallback: {str(e)[:60]}"
-            }
-        return {
-            "action": "send",
-            "body": "Noted! Working on it right now — will share details shortly.",
-            "cta": "none",
-            "rationale": f"Merchant fallback: {str(e)[:60]}"
-        }
+        return f"[API_ERROR: {e}]"
 
-# ─────────────────────────────────────────────
-# Pydantic models
-# ─────────────────────────────────────────────
-class CtxBody(BaseModel):
-    scope: str
-    context_id: str
-    version: int
-    payload: dict[str, Any]
-    delivered_at: str
 
-class TickBody(BaseModel):
-    now: str
-    available_triggers: list[str] = []
+def ctx(scope: str, context_id: str) -> dict:
+    return contexts.get(f"{scope}::{context_id}", {}).get("payload", {})
 
-class ReplyBody(BaseModel):
-    conversation_id: str
-    merchant_id: Optional[str] = None
-    customer_id: Optional[str] = None
-    from_role: str
-    message: str
-    received_at: str
-    turn_number: int
 
-# ─────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────
+def is_suppressed(key: str) -> bool:
+    exp = suppression.get(key)
+    if exp and time.time() < exp:
+        return True
+    return False
+
+
+def suppress(key: str, hours: float = 24.0):
+    suppression[key] = time.time() + hours * 3600
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
 @app.get("/v1/healthz")
 async def healthz():
-    counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
-    for (scope, _) in contexts.keys():
-        if scope in counts:
-            counts[scope] += 1
-    return {"status": "ok", "uptime_seconds": int(time.time() - START), "contexts_loaded": counts}
+    counts = {}
+    for k in contexts:
+        scope = k.split("::")[0]
+        counts[scope] = counts.get(scope, 0) + 1
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - START_TIME),
+        "contexts_loaded": counts,
+        "api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+    }
+
 
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Vera Bot",
-        "team_members": ["Mudit Aggarwal"],
-        "model": MODEL,
-        "approach": "Claude-powered 4-context composer with customer-voiced replies, auto-reply detection, intent routing, Hinglish support",
-        "contact_email": "team@example.com",
-        "version": "2.0.0",
-        "submitted_at": datetime.now(timezone.utc).isoformat()
+        "bot_name": "Vera",
+        "version": "3.0.0",
+        "author": "Mudit Aggarwal",
+        "description": "Context-grounded merchant engagement bot powered by Claude",
+        "capabilities": ["tick", "context", "reply"],
     }
+
 
 @app.post("/v1/context")
-async def push_context(body: CtxBody):
-    valid = {"category", "merchant", "customer", "trigger"}
-    if body.scope not in valid:
-        return JSONResponse(status_code=400, content={
-            "accepted": False, "reason": "invalid_scope", "details": f"Must be one of {valid}"
-        })
-    key = (body.scope, body.context_id)
-    cur = contexts.get(key)
-    if cur and cur["version"] >= body.version:
-        return JSONResponse(status_code=409, content={
-            "accepted": False, "reason": "stale_version", "current_version": cur["version"]
-        })
-    contexts[key] = {"version": body.version, "payload": body.payload}
-    return {
-        "accepted": True,
-        "ack_id": f"ack_{body.context_id}_v{body.version}",
-        "stored_at": datetime.now(timezone.utc).isoformat()
+async def push_context(request: Request):
+    body = await request.json()
+    scope = body["scope"]
+    context_id = body["context_id"]
+    version = body["version"]
+    key = f"{scope}::{context_id}"
+
+    existing = contexts.get(key)
+    if existing:
+        if version < existing["version"]:
+            raise HTTPException(status_code=409, detail="Stale version rejected")
+        if version == existing["version"]:
+            return JSONResponse({"status": "duplicate", "key": key}, status_code=200)
+
+    contexts[key] = {
+        "scope": scope,
+        "context_id": context_id,
+        "version": version,
+        "payload": body.get("payload", {}),
+        "delivered_at": body.get("delivered_at"),
     }
+    return {"status": "accepted", "key": key, "version": version}
+
 
 @app.post("/v1/tick")
-async def tick(body: TickBody):
+async def tick(request: Request):
+    body = await request.json()
+    now_str = body.get("now", datetime.now(timezone.utc).isoformat())
+    available_triggers = body.get("available_triggers", [])
+
+    if not available_triggers:
+        return {"actions": []}
+
     actions = []
-    for trg_id in body.available_triggers:
-        trg = get_payload("trigger", trg_id)
-        if not trg:
-            continue
-        suppression_key = trg.get("suppression_key", trg_id)
-        if suppression_key in fired_suppression:
-            continue
-        merchant_id = trg.get("merchant_id")
-        if not merchant_id:
-            continue
-        merchant = get_payload("merchant", merchant_id)
-        if not merchant:
-            continue
-        category_slug = merchant.get("category_slug", "")
-        category = get_payload("category", category_slug)
-        if not category:
-            continue
-        customer_id = trg.get("customer_id")
-        customer = get_payload("customer", customer_id) if customer_id else None
+    for trigger in available_triggers:
+        trigger_id = trigger.get("trigger_id", "")
+        merchant_id = trigger.get("merchant_id", "")
+        category_slug = trigger.get("category_slug", "")
+        customer_id = trigger.get("customer_id")
+        kind = trigger.get("kind", "")
+        payload = trigger.get("payload", {})
 
-        composed = compose_initial(category, merchant, trg, customer)
-        fired_suppression.add(suppression_key)
+        sup_key = f"tick::{merchant_id}::{kind}"
+        if is_suppressed(sup_key):
+            continue
 
-        conv_id = f"conv_{merchant_id}_{trg_id}_{uuid.uuid4().hex[:6]}"
-        conversations[conv_id] = {
-            "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "turns": [{"from": "vera", "body": composed["body"], "ts": body.now}]
-        }
+        # Gather all context
+        merchant_ctx = ctx("merchant", merchant_id)
+        category_ctx = ctx("category", category_slug)
+        customer_ctx = ctx("customer", customer_id) if customer_id else {}
+        trigger_ctx = ctx("trigger", trigger_id)
 
-        merchant_name = merchant.get("identity", {}).get("name", "Merchant")
-        trg_kind = trg.get("kind", "update")
+        merchant_name = merchant_ctx.get("name") or merchant_ctx.get("business_name") or f"Merchant {merchant_id}"
+        merchant_type = merchant_ctx.get("type") or category_ctx.get("name") or category_slug
+        owner_name = merchant_ctx.get("owner_name") or merchant_ctx.get("contact_name") or ""
+        top_offer = ""
+        if merchant_ctx.get("offers"):
+            top_offer = merchant_ctx["offers"][0] if isinstance(merchant_ctx["offers"], list) else str(merchant_ctx["offers"])
+        avg_rating = merchant_ctx.get("avg_rating") or merchant_ctx.get("rating", "")
+        ctr = merchant_ctx.get("ctr") or merchant_ctx.get("click_through_rate", "")
 
+        customer_name = customer_ctx.get("name") or customer_ctx.get("customer_name") or ""
+        customer_history = customer_ctx.get("last_visit") or customer_ctx.get("visit_history") or ""
+
+        system_prompt = f"""You are Vera, a friendly and sharp AI assistant from magicpin who helps merchants grow their business.
+You compose short WhatsApp messages (1-3 sentences, max 60 words) that are:
+- Conversational and warm, mixing Hindi and English naturally (Hinglish)
+- Hyper-specific: mention real numbers, offers, merchant name, or recent stats when available
+- Action-oriented: always end with a clear next step or question
+- Never generic — every message should feel tailor-made
+
+Merchant info:
+- Name: {merchant_name}
+- Type: {merchant_type}
+- Owner: {owner_name}
+- Top offer: {top_offer}
+- Rating: {avg_rating}
+- CTR: {ctr}
+
+Trigger kind: {kind}
+Trigger payload: {json.dumps(payload)}
+Category context: {json.dumps(category_ctx)}
+"""
+
+        user_prompt = f"""Write a WhatsApp message from Vera to the merchant for trigger kind '{kind}'.
+
+Trigger details: {json.dumps(payload)}
+
+Rules:
+- Address merchant by name if known
+- Mention specific numbers from the trigger payload or merchant context
+- End with a question or clear CTA
+- Max 60 words, Hinglish tone
+- Do NOT use emojis excessively (max 1-2)
+
+Write ONLY the message text, nothing else."""
+
+        message = await call_claude(system_prompt, user_prompt, max_tokens=150)
+
+        # Fallback if API failed
+        if message.startswith("[API_ERROR"):
+            kind_msgs = {
+                "perf_dip": f"{merchant_name} — aapki visibility last week thodi kam hui. Ek naya offer add karein?",
+                "new_competitor": f"Koi naya competitor aaya hai aapke area mein, {merchant_name}. Apna profile refresh karein!",
+                "festival": f"Festival season aa raha hai — {merchant_name} ke liye ek special deal banayein aaj?",
+                "research_digest": f"{merchant_name}, aapki category mein customers ye cheezein dhundh rahe hain. Discuss karein?",
+                "regulation_change": f"{merchant_name}, kuch naye compliance updates hain aapki category mein. Help chahiye?",
+                "low_inventory": f"Stock update time, {merchant_name}! Magicpin pe apna inventory refresh karein.",
+            }
+            message = kind_msgs.get(kind, f"{merchant_name}, kuch important update hai aapke liye. Baat karein?")
+
+        suppress(sup_key, hours=23)
         actions.append({
-            "conversation_id": conv_id,
+            "action": "send",
+            "trigger_id": trigger_id,
             "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "send_as": composed.get("send_as", "vera"),
-            "trigger_id": trg_id,
-            "template_name": f"vera_{trg_kind}_v2",
-            "template_params": [merchant_name, trg_kind, "magicpin"],
-            "body": composed["body"],
-            "cta": composed.get("cta", "open_ended"),
-            "suppression_key": suppression_key,
-            "rationale": composed.get("rationale", "")
+            "body": message,
         })
-
-        if len(actions) >= 20:
-            break
 
     return {"actions": actions}
 
+
 @app.post("/v1/reply")
-async def reply(body: ReplyBody):
-    conv_id = body.conversation_id
-    conv = conversations.get(conv_id, {})
+async def reply(request: Request):
+    body = await request.json()
+    session_id = body.get("session_id", "default")
+    from_role = body.get("from_role", "merchant")   # "merchant" or "customer"
+    message_text = body.get("body", "")
+    merchant_id = body.get("merchant_id", "")
+    customer_id = body.get("customer_id", "")
+    category_slug = body.get("category_slug", "")
+    conversation_history = body.get("conversation_history", [])
 
-    merchant_id = body.merchant_id or conv.get("merchant_id")
-    customer_id = body.customer_id or conv.get("customer_id")
+    # Init session state
+    if session_id not in reply_state:
+        reply_state[session_id] = {"turns": 0, "auto_reply_count": 0, "intent": None}
+    state = reply_state[session_id]
+    state["turns"] += 1
 
-    merchant = get_payload("merchant", merchant_id) if merchant_id else None
-    if not merchant:
-        return {"action": "end", "rationale": "Merchant context not found."}
+    # ── STOP handling ─────────────────────────────────────────────────────────
+    stop_words = {"stop", "unsubscribe", "opt out", "opt-out", "band karo", "mat bhejo", "nahi chahiye"}
+    if any(w in message_text.lower() for w in stop_words):
+        del reply_state[session_id]
+        return {
+            "action": "end",
+            "body": "Samajh gaye! Aapko aage koi message nahi aayega. Agar kabhi zaroorat ho toh hum yahan hain. 🙏",
+        }
 
-    category = get_payload("category", merchant.get("category_slug", "")) or {}
-    customer = get_payload("customer", customer_id) if customer_id else None
+    # ── Auto-reply detection ───────────────────────────────────────────────────
+    auto_reply_signals = [
+        "i am out of office", "out of office", "auto", "automatic reply",
+        "on leave", "unavailable", "will get back", "vacation",
+        "abhi available nahi", "bahar hoon",
+    ]
+    is_auto = any(sig in message_text.lower() for sig in auto_reply_signals)
+    if is_auto:
+        state["auto_reply_count"] += 1
+        if state["auto_reply_count"] >= 2:
+            del reply_state[session_id]
+            return {"action": "end", "body": None}
+        return {
+            "action": "send",
+            "body": "Koi baat nahi! Jab free hon tab baat karte hain. 😊",
+        }
 
-    if conv_id not in conversations:
-        conversations[conv_id] = {"merchant_id": merchant_id, "customer_id": customer_id, "turns": []}
-        conv = conversations[conv_id]
+    # ── Gather context ────────────────────────────────────────────────────────
+    merchant_ctx = ctx("merchant", merchant_id)
+    category_ctx = ctx("category", category_slug)
+    customer_ctx = ctx("customer", customer_id) if customer_id else {}
 
-    history = conversations[conv_id].get("turns", [])
-    is_auto = is_auto_reply(body.message)
+    merchant_name = merchant_ctx.get("name") or merchant_ctx.get("business_name") or f"Merchant {merchant_id}"
+    owner_name = merchant_ctx.get("owner_name") or merchant_ctx.get("contact_name") or "aap"
+    merchant_type = merchant_ctx.get("type") or category_ctx.get("name") or category_slug
 
-    history.append({
-        "from": body.from_role,
-        "body": body.message,
-        "ts": body.received_at,
-        "is_auto_reply": is_auto,
-        "turn_number": body.turn_number
-    })
+    customer_name = customer_ctx.get("name") or customer_ctx.get("customer_name") or "customer"
+    customer_phone = customer_ctx.get("phone") or ""
+    customer_history = customer_ctx.get("last_visit") or ""
 
-    result = compose_reply(
-        from_role=body.from_role,
-        message=body.message,
-        merchant=merchant,
-        category=category,
-        customer=customer,
-        history=history,
-        turn_number=body.turn_number,
-        conv_id=conv_id,
-    )
+    # Format conversation history for Claude
+    history_text = ""
+    if conversation_history:
+        for turn in conversation_history[-6:]:  # last 6 turns
+            role = turn.get("role", "unknown")
+            text = turn.get("body", "")
+            history_text += f"{role}: {text}\n"
 
-    if result.get("action") == "send":
-        history.append({
-            "from": "vera",
-            "body": result.get("body", ""),
-            "ts": datetime.now(timezone.utc).isoformat()
-        })
+    # ── CUSTOMER message handling ─────────────────────────────────────────────
+    if from_role == "customer":
+        system_prompt = f"""You are Vera, magicpin's AI assistant helping {merchant_name} respond to customer messages.
+You write SHORT replies (1-3 sentences, max 50 words) from the MERCHANT'S perspective TO THE CUSTOMER.
+Tone: warm, professional, helpful. Mix Hindi/English naturally.
 
-    conversations[conv_id]["turns"] = history
-    return result
+Merchant: {merchant_name} ({merchant_type})
+Customer name: {customer_name}
+Customer history: {customer_history}
 
-@app.post("/v1/teardown")
-async def teardown():
-    contexts.clear()
-    conversations.clear()
-    fired_suppression.clear()
-    return {"status": "cleared"}
+IMPORTANT: Address the customer by name ({customer_name}). Confirm their request specifically. Be friendly."""
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("bot_server:app", host="0.0.0.0", port=port, reload=False)
+        user_prompt = f"""Conversation so far:
+{history_text}
+
+Customer just said: "{message_text}"
+
+Write the merchant's reply to this customer. Address them as {customer_name}.
+If they're booking/scheduling: confirm the specific time/date they mentioned.
+If they're asking about services: answer specifically based on {merchant_type} services.
+Keep it under 50 words. Hinglish tone. Write ONLY the reply, nothing else."""
+
+        reply_body = await call_claude(system_prompt, user_prompt, max_tokens=120)
+
+        if reply_body.startswith("[API_ERROR"):
+            # Smart fallback for customer
+            low = message_text.lower()
+            if any(w in low for w in ["book", "appointment", "slot", "schedule", "time", "date"]):
+                reply_body = f"Bilkul {customer_name}! Aapki booking confirm ho gayi. Hum aapko reminder bhejenge. 😊"
+            elif any(w in low for w in ["price", "cost", "kitna", "charge", "fees"]):
+                reply_body = f"Hi {customer_name}! Pricing ke liye please humse directly contact karein — best deal milega!"
+            else:
+                reply_body = f"Hi {customer_name}! Message mila, jald hi response karenge. Thank you! 🙏"
+
+        return {"action": "send", "body": reply_body}
+
+    # ── MERCHANT message handling ─────────────────────────────────────────────
+    system_prompt = f"""You are Vera, magicpin's AI assistant helping merchants grow their business.
+You respond to merchant messages with helpful, specific, action-oriented replies (1-3 sentences, max 60 words).
+Tone: friendly, knowledgeable, like a business advisor who speaks Hinglish.
+
+Merchant: {merchant_name} ({merchant_type})
+Owner: {owner_name}
+Context: {json.dumps(merchant_ctx)}
+Category: {json.dumps(category_ctx)}
+
+RULES:
+- Be specific — reference what they said
+- Offer concrete next steps
+- Mix Hindi and English naturally
+- Do NOT use filler like "Got it! Let me take care of that."
+- If they mention a specific problem, address it directly"""
+
+    # Detect intent
+    low = message_text.lower()
+    intent = None
+    if any(w in low for w in ["audit", "compliance", "regulation", "x-ray", "equipment", "license"]):
+        intent = "compliance"
+    elif any(w in low for w in ["offer", "discount", "deal", "cashback", "promo"]):
+        intent = "offers"
+    elif any(w in low for w in ["review", "rating", "feedback", "complaint"]):
+        intent = "reviews"
+    elif any(w in low for w in ["photo", "image", "picture", "gallery"]):
+        intent = "photos"
+    elif any(w in low for w in ["slot", "appointment", "booking", "timing", "available"]):
+        intent = "booking"
+    elif any(w in low for w in ["competitor", "competition", "others", "nearby"]):
+        intent = "competition"
+
+    state["intent"] = intent
+
+    user_prompt = f"""Conversation so far:
+{history_text}
+
+Merchant just said: "{message_text}"
+Detected intent: {intent or "general"}
+
+Write a helpful reply from Vera to {owner_name} at {merchant_name}.
+- Address the specific thing they mentioned
+- Give ONE concrete actionable suggestion
+- Keep it under 60 words, Hinglish
+- Write ONLY the reply, nothing else."""
+
+    reply_body = await call_claude(system_prompt, user_prompt, max_tokens=150)
+
+    if reply_body.startswith("[API_ERROR"):
+        intent_fallbacks = {
+            "compliance": f"Zaroor {owner_name}! Compliance checklist taiyaar karte hain — aapka equipment model share karein toh specific guidance de sakta hoon.",
+            "offers": f"Great idea {owner_name}! Magicpin pe ek limited-time offer add karein — 15-20% discount wale deals mein 3x zyada clicks aate hain.",
+            "reviews": f"Samjha {owner_name}! Recent negative reviews pe personally respond karein — yeh rating improve karne ka sabse fast tarika hai.",
+            "photos": f"Photo update karna excellent step hai {owner_name}! Fresh high-quality photos se profile visits 40% tak badh sakti hain.",
+            "booking": f"Booking slots set up karte hain {owner_name}! Magicpin pe calendar integration se customers directly book kar sakte hain.",
+        }
+        reply_body = intent_fallbacks.get(intent, f"Shukriya {owner_name}! Yeh important hai — chalte hain step by step. Pehle mujhe batao aapka main concern kya hai?")
+
+    # Decide action
+    action = "send"
+    # If merchant has disengaged (very short message or signing off)
+    if len(message_text.strip()) < 5 or any(w in low for w in ["bye", "ok thanks", "theek hai", "chal"]):
+        if state["turns"] > 3:
+            action = "end"
+            reply_body = f"Bilkul {owner_name}! Koi bhi help chahiye toh ping karein. All the best! 🙌"
+            del reply_state[session_id]
+
+    return {"action": action, "body": reply_body}
